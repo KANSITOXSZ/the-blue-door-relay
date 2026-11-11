@@ -11,7 +11,83 @@ const salas = new Map(); // codigo -> { host, clientes: Map(id -> ws), sig }
 
 const i32 = (n) => { const b = Buffer.alloc(4); b.writeInt32LE(n); return b; };
 
-const server = http.createServer((req, res) => { res.writeHead(200); res.end('The Blue Door relay OK\n'); });
+// ---------- Datos en la nube (un registro por nombre de usuario) ----------
+// El primer dispositivo que guarda un nombre se queda con el. Si otro dispositivo usa el mismo
+// nombre, recibe 409 y el juego guarda solo en ese dispositivo.
+// Almacenamiento: si defines UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN se guarda en Upstash
+// (gratis y permanente). Si no, en archivos dentro de DATA_DIR (en Render gratis se BORRAN al reiniciar).
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'datos');
+const UP_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+
+function claveNombre(n) { return String(n || '').toUpperCase().replace(/[^A-Z0-9_]/g, '').slice(0, 10); }
+
+function upstash(cmd) {
+  return new Promise((ok, fail) => {
+    const u = new URL(UP_URL);
+    const body = JSON.stringify(cmd);
+    const rq = https.request({ hostname: u.hostname, path: u.pathname || '/', method: 'POST', port: u.port || 443,
+      headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (r) => {
+      let t = ''; r.on('data', (d) => t += d); r.on('end', () => { try { ok(JSON.parse(t).result); } catch (e) { fail(e); } });
+    });
+    rq.on('error', fail); rq.setTimeout(10000, () => rq.destroy(new Error('timeout'))); rq.end(body);
+  });
+}
+async function leerRegistro(clave) {
+  if (UP_URL) { const v = await upstash(['GET', 'bd:' + clave]); return v ? JSON.parse(v) : null; }
+  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, clave + '.json'), 'utf8')); } catch (e) { return null; }
+}
+async function escribirRegistro(clave, reg) {
+  if (UP_URL) { await upstash(['SET', 'bd:' + clave, JSON.stringify(reg)]); return; }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(path.join(DATA_DIR, clave + '.json'), JSON.stringify(reg));
+}
+
+function json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(obj));
+}
+
+async function manejarNube(req, res, url) {
+  try {
+    if (req.method === 'GET') {
+      const clave = claveNombre(url.searchParams.get('nombre'));
+      const disp = String(url.searchParams.get('dispositivo') || '');
+      if (!clave || !disp) return json(res, 400, { estado: 'faltan_datos' });
+      const reg = await leerRegistro(clave);
+      if (!reg) return json(res, 404, { estado: 'libre' });
+      if (reg.dispositivo !== disp) return json(res, 409, { estado: 'ocupado' });
+      return json(res, 200, { estado: 'ok', datos: reg.datos });
+    }
+    if (req.method === 'POST') {
+      let cuerpo = '';
+      req.on('data', (d) => { cuerpo += d; if (cuerpo.length > 65536) req.destroy(); });
+      req.on('end', async () => {
+        try {
+          const o = JSON.parse(cuerpo);
+          const clave = claveNombre(o.nombre);
+          const disp = String(o.dispositivo || '');
+          if (!clave || !disp || typeof o.datos !== 'string') return json(res, 400, { estado: 'faltan_datos' });
+          const reg = await leerRegistro(clave);
+          if (reg && reg.dispositivo !== disp) return json(res, 409, { estado: 'ocupado' });
+          await escribirRegistro(clave, { dispositivo: disp, datos: o.datos, actualizado: Date.now() });
+          return json(res, 200, { estado: 'guardado' });
+        } catch (e) { return json(res, 500, { estado: 'error' }); }
+      });
+      return;
+    }
+    json(res, 405, { estado: 'metodo' });
+  } catch (e) { json(res, 500, { estado: 'error' }); }
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname === '/nube') { manejarNube(req, res, url); return; }
+  res.writeHead(200); res.end('The Blue Door relay OK\n');
+});
 
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
